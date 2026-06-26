@@ -37,6 +37,15 @@ class MavenArtifactSerializer(platform.SingleArtifactContentUploadSerializer):
     )
     filename = serializers.CharField(help_text=_("Filename of the artifact."), read_only=True)
 
+    def retrieve(self, validated_data):
+        return models.MavenArtifact.objects.filter(
+            group_id=validated_data["group_id"],
+            artifact_id=validated_data["artifact_id"],
+            version=validated_data["version"],
+            filename=validated_data["filename"],
+            pulp_domain=get_domain_pk(),
+        ).first()
+
     def create(self, validated_data):
         group_id, artifact_id, version, filename = (
             models.MavenArtifact.group_artifact_version_filename(validated_data["relative_path"])
@@ -69,9 +78,9 @@ class MavenArtifactUploadSerializer(MavenArtifactSerializer):
             and isinstance(kwargs["data"]["pulp_labels"], str)
         ):
             try:
-                data = kwargs["data"].copy()
-                data["pulp_labels"] = json.loads(data["pulp_labels"])
-                kwargs["data"] = data
+                kwargs["data"]._mutable = True
+                kwargs["data"]["pulp_labels"] = json.loads(kwargs["data"]["pulp_labels"])
+                kwargs["data"]._mutable = False
             except (json.JSONDecodeError, AttributeError):
                 pass
         super().__init__(*args, **kwargs)
