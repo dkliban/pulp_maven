@@ -717,7 +717,6 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
                 Pass an explicit set (e.g. from ``repair_index_pages``) to regenerate a
                 specific or complete collection of directories regardless of the diff.
         """
-        import re as _re
 
         from pulpcore.plugin.content import Handler
         from pulpcore.plugin.models import ContentArtifact, RemoteArtifact
@@ -757,56 +756,78 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
                 for i in range(len(parts)):
                     affected_paths.add("" if i == 0 else "/".join(parts[:i]) + "/")
 
-        # Pre-fetch RepositoryContent dates once to avoid one DB query per directory
-        # (calling _content_relationships() inside the loop would be an N+1 pattern).
+        # Pre-fetch RepositoryContent dates once (one query instead of one per directory).
         rc_dates = {
             rc.content_id: rc.pulp_created
             for rc in new_version._content_relationships().only("content_id", "pulp_created")
         }
 
-        for dir_path in affected_paths:
-            # Remove the stale index page for this directory (inherited from previous version).
-            stale = MavenIndexPage.objects.filter(pk__in=new_version.content, path=dir_path)
-            if stale.exists():
-                new_version.remove_content(stale)
-
-            # Build the directory listing, excluding index.html entries.
-            cas = (
-                ContentArtifact.objects.select_related("artifact")
-                .filter(content__in=new_version.content, relative_path__startswith=dir_path)
-                .exclude(content__pulp_type="maven.index-page")
+        # Pre-fetch all existing index pages so we can remove stale ones without
+        # issuing one EXISTS query per directory.
+        existing_index_pks = {
+            row["path"]: row["pk"]
+            for row in MavenIndexPage.objects.filter(pk__in=new_version.content).values(
+                "path", "pk"
             )
+        }
 
-            pattern = _re.compile(r"({})([^\/]*)(\/*)".format(_re.escape(dir_path)))
-            directory_list = set()
-            dates = {}
-            sizes = {}
-            artifacts_to_find = {}
+        # Fetch ALL ContentArtifacts for the version in one query and build every
+        # directory listing in Python.  This replaces the previous O(directories) loop
+        # of per-directory DB queries with a single scan + in-memory grouping.
+        all_cas = list(
+            ContentArtifact.objects.select_related("artifact")
+            .filter(content__in=new_version.content)
+            .exclude(content__pulp_type="maven.index-page")
+        )
 
-            for ca in cas:
-                m = pattern.match(ca.relative_path)
-                if not m:
+        # Resolve on-demand sizes (RemoteArtifact) in one query.
+        ca_pks_without_artifact = [ca.pk for ca in all_cas if not ca.artifact]
+        remote_sizes: dict = {}
+        if ca_pks_without_artifact:
+            for ra_ca_id, size in RemoteArtifact.objects.filter(
+                content_artifact__in=ca_pks_without_artifact, size__isnull=False
+            ).values_list("content_artifact_id", "size"):
+                remote_sizes[ra_ca_id] = size
+
+        # Build per-directory data structures in one pass over all ContentArtifacts.
+        # Each directory accumulates the direct-child names, dates, and sizes that
+        # render_html() expects — matching list_directory() semantics.
+        dir_entries: dict = {dp: {} for dp in affected_paths}
+
+        for ca in all_cas:
+            parts = ca.relative_path.split("/")
+            ca_size = ca.artifact.size if ca.artifact else remote_sizes.get(ca.pk)
+            ca_date = rc_dates.get(ca.content_id, ca.pulp_created)
+
+            for i in range(len(parts)):
+                dir_path = "" if i == 0 else "/".join(parts[:i]) + "/"
+                if dir_path not in dir_entries:
                     continue
-                name = "{}{}".format(m.group(2), m.group(3))
+                # Direct child entry: subdirectory or file.
+                name = (parts[i] + "/") if i + 1 < len(parts) else parts[i]
                 if not name:
                     continue
-                directory_list.add(name)
-                # Use the RepositoryContent date (when content joined this repo) to match
-                # list_directory() behaviour; fall back to ContentArtifact creation time.
-                dates[name] = rc_dates.get(ca.content_id, ca.pulp_created)
-                if ca.artifact:
-                    sizes[name] = ca.artifact.size
-                else:
-                    artifacts_to_find[ca.pk] = name
+                # Last CA for this name wins (matches list_directory() behaviour).
+                dir_entries[dir_path][name] = {
+                    "content_id": ca.content_id,
+                    "size": ca_size,
+                    "date": ca_date,
+                }
+
+        for dir_path, entries in dir_entries.items():
+            # Remove the stale index page (uses pre-fetched dict, no extra DB query).
+            if dir_path in existing_index_pks:
+                new_version.remove_content(
+                    MavenIndexPage.objects.filter(pk=existing_index_pks[dir_path])
+                )
+
+            directory_list = set(entries.keys())
 
             if not directory_list:
                 continue
 
-            if artifacts_to_find:
-                r_artifacts = RemoteArtifact.objects.filter(
-                    content_artifact__in=artifacts_to_find.keys(), size__isnull=False
-                ).values_list("content_artifact_id", "size")
-                sizes.update({artifacts_to_find[ra_ca_id]: size for ra_ca_id, size in r_artifacts})
+            dates = {name: e["date"] for name, e in entries.items()}
+            sizes = {name: e["size"] for name, e in entries.items() if e["size"] is not None}
 
             html_bytes = Handler.render_html(
                 directory_list, path=dir_path, dates=dates, sizes=sizes
