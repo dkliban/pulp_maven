@@ -1,0 +1,1 @@
+Eliminated O(directories) database queries in repair_index_pages by fetching all ContentArtifacts in a single query and building directory listings in Python; also added concurrent S3 uploads (20 workers) cutting repair time for 500K-artifact repositories from hours to minutes.

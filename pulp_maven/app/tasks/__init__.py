@@ -102,7 +102,20 @@ def _save_prefixes_txt(prefixes, pulp_domain):
 
 
 def _save_artifact(content_bytes, pulp_domain):
-    """Write bytes to a temp file and create a Pulp Artifact via init_and_validate."""
+    """Write bytes to a temp file and create a Pulp Artifact via init_and_validate.
+
+    Computes sha256 in memory first and returns the existing Artifact immediately
+    if one with that digest already exists — avoiding a NamedTemporaryFile open/close
+    cycle for every call.  Without this fast path, repair_index_pages exhausts the
+    process file-descriptor limit ([Errno 24]) because init_and_validate opens the
+    temp file for hashing while the NamedTemporaryFile descriptor is still open.
+    """
+    sha256 = hashlib.sha256(content_bytes).hexdigest()
+    try:
+        return Artifact.objects.get(sha256=sha256, pulp_domain=pulp_domain)
+    except Artifact.DoesNotExist:
+        pass
+
     with tempfile.NamedTemporaryFile() as tmp:
         tmp.write(content_bytes)
         tmp.flush()
@@ -113,7 +126,7 @@ def _save_artifact(content_bytes, pulp_domain):
                 artifact.save()
         except IntegrityError:
             artifact = Artifact.objects.get(
-                sha256=artifact.sha256,
+                sha256=sha256,
                 pulp_domain=pulp_domain,
             )
     return artifact
