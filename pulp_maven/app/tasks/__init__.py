@@ -316,6 +316,70 @@ def repair_metadata(repository_pk):
     )
 
 
+def repair_index_pages(repository_pk):
+    """Generate (or regenerate) HTML index pages for every directory in the latest version.
+
+    Scans every non-index ContentArtifact path in the latest repository version, derives
+    the full set of ancestor directory paths, and creates a new repository version with
+    fresh ``MavenIndexPage`` content units for all of them — replacing any stale pages.
+
+    This is a one-time catch-up for repositories created before the pre-generation feature
+    was deployed.  After this task completes every directory URL in the repository will be
+    served by a pre-generated page rather than the on-demand fallback.
+
+    Args:
+        repository_pk (str): Primary key of the MavenRepository.
+    """
+    from pulp_maven.app.models import MavenIndexPage, _pull_through_ctx
+
+    repository = MavenRepository.objects.get(pk=repository_pk)
+    latest_version = repository.latest_version()
+
+    if not latest_version:
+        return
+
+    # Derive all ancestor directory paths from every non-index ContentArtifact.
+    all_paths = set()
+    for (relative_path,) in (
+        ContentArtifact.objects.filter(
+            content__in=latest_version.content,
+        )
+        .exclude(
+            content__pulp_type="maven.index-page",
+        )
+        .values_list("relative_path")
+    ):
+        parts = relative_path.split("/")
+        for i in range(len(parts)):
+            all_paths.add("" if i == 0 else "/".join(parts[:i]) + "/")
+
+    if not all_paths:
+        log.info(
+            "repair_index_pages: repository=%s has no content — nothing to do",
+            repository.name,
+        )
+        return
+
+    _pull_through_ctx.active = True
+    try:
+        with repository.new_version() as new_version:
+            # Drop every existing index page so we start clean.
+            stale = MavenIndexPage.objects.filter(pk__in=new_version.content)
+            if stale.exists():
+                new_version.remove_content(stale)
+
+            # Regenerate pages for every directory using the shared implementation.
+            repository._generate_index_pages(new_version, affected_paths=all_paths)
+    finally:
+        _pull_through_ctx.active = False
+
+    log.info(
+        "Repaired index pages: repository=%s, directories=%d",
+        repository.name,
+        len(all_paths),
+    )
+
+
 def _save_metadata_content(group_id, artifact_id, version, base_path, metadata_xml, pulp_domain):
     """Save maven-metadata.xml and checksum files as MavenMetadata content.
 

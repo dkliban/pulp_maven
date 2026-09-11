@@ -352,6 +352,21 @@ class MavenRepositoryMetricsSerializer(serializers.Serializer):
     )
 
 
+class MavenIndexPageSerializer(platform.NoArtifactContentSerializer):
+    """
+    A read-only Serializer for MavenIndexPage.
+    """
+
+    path = serializers.CharField(help_text=_("Directory path this page indexes."), read_only=True)
+    sha256 = serializers.CharField(
+        help_text=_("SHA256 digest of the HTML content."), read_only=True
+    )
+
+    class Meta:
+        fields = platform.NoArtifactContentSerializer.Meta.fields + ("path", "sha256")
+        model = models.MavenIndexPage
+
+
 class MavenRemoteSerializer(platform.RemoteSerializer):
     """
     A Serializer for MavenRemote.

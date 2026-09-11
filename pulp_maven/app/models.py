@@ -4,7 +4,7 @@ from gettext import gettext as _
 from logging import getLogger
 from os import path
 
-from django.db import models
+from django.db import IntegrityError, models, transaction
 
 from pulpcore.plugin.models import (
     AutoAddObjPermsMixin,
@@ -180,8 +180,8 @@ class MavenPackage(Content):
     A logical Maven package at the GAV (groupId, artifactId, version) level.
 
     Groups MavenArtifact files that share the same GAV coordinates.
-    Created when a ``.pom`` file is saved (deploy API, REST upload).
-    ``finalize_new_version`` creates missing packages as a fallback when a POM is available.
+    Created when a `.pom` file is saved (deploy API, REST upload).
+    `finalize_new_version` creates missing packages as a fallback when a POM is available.
     SNAPSHOT versions are mutable — metadata is refreshed on each POM upload.
     """
 
@@ -226,6 +226,28 @@ class MavenPackage(Content):
         self.licenses = meta["licenses"]
         self.dependencies = meta["dependencies"]
         self.scm_url = meta["scm_url"]
+
+
+class MavenIndexPage(Content):
+    """
+    A pre-generated HTML directory index page.
+
+    One per directory path. The associated ContentArtifact uses
+    `relative_path = f"{path}index.html"`, which is exactly what the
+    pulpcore handler looks up when a client requests a directory URL.
+    Keyed on `path` so there is at most one live index page per directory.
+    """
+
+    TYPE = "index-page"
+    repo_key_fields = ("path",)
+
+    _pulp_domain = models.ForeignKey("core.Domain", default=get_domain_pk, on_delete=models.PROTECT)
+    path = models.CharField(max_length=1024, null=False)
+    sha256 = models.CharField(max_length=64, null=False, db_index=True)
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"
+        unique_together = ("path", "sha256", "_pulp_domain")
 
 
 class MavenRemote(Remote, AutoAddObjPermsMixin):
@@ -277,6 +299,76 @@ class MavenDistribution(Distribution, AutoAddObjPermsMixin):
 
     TYPE = "maven"
 
+    def content_handler(self, path):
+        """Serve pre-generated HTML index pages inline, bypassing redirect-to-object-storage.
+
+        When a client requests a directory URL, pulpcore's default path calls
+        `_serve_content_artifact` which issues a 302 redirect to S3/Azure/GCS for the
+        index.html artifact. That redirect changes the Content-Type to
+        ``attachment`` and breaks browser rendering.
+
+        Instead, read the small HTML bytes here and return an inline response so that
+        directory listings are always served directly, regardless of storage backend.
+        """
+        from aiohttp.web import HTTPMovedPermanently, Response
+
+        from pulpcore.plugin.models import ContentArtifact
+
+        # Resolve the live repository version for this distribution.
+        if self.repository_version_id:
+            version = self.repository_version
+        elif self.repository_id:
+            version = self.repository.latest_version()
+        else:
+            return None
+
+        if version is None:
+            return None
+
+        # For paths WITHOUT a trailing slash, check whether a pre-generated index page
+        # exists.  If so issue a redirect to the trailing-slash form; the next request
+        # will be served inline by the branch below.  The normal fallback (line ~851 in
+        # handler.py) only does this redirect when using on-demand list_directory(), not
+        # when an index.html ContentArtifact is found, so we handle it here instead.
+        if path and not path.endswith("/"):
+            # Skip the DB lookup for obvious file requests (any path whose last segment
+            # contains a dot — .jar, .pom, .sha1, .xml, etc.).  content_handler is called
+            # for every request, so this avoids a wasted ContentArtifact query per download.
+            last_segment = path.rsplit("/", 1)[-1] if "/" in path else path
+            if "." in last_segment:
+                return None
+
+            has_index = ContentArtifact.objects.filter(
+                content__in=version.content,
+                content__pulp_type="maven.index-page",
+                relative_path=f"{path}/index.html",
+            ).exists()
+            if has_index:
+                raise HTTPMovedPermanently(f"{last_segment}/")
+            return None
+
+        # For paths WITH a trailing slash (or the distribution root ""), serve the
+        # pre-generated index page inline as text/html, bypassing _serve_content_artifact
+        # which would issue a 302 redirect to object storage.
+        index_rel_path = f"{path}index.html"
+        ca = (
+            ContentArtifact.objects.filter(
+                content__in=version.content,
+                content__pulp_type="maven.index-page",
+                relative_path=index_rel_path,
+            )
+            .select_related("artifact")
+            .first()
+        )
+
+        if ca is None or ca.artifact is None:
+            return None
+
+        with ca.artifact.file.open("rb") as fh:
+            html_bytes = fh.read()
+
+        return Response(body=html_bytes, content_type="text/html", charset="utf-8")
+
     class Meta:
         default_related_name = "%(app_label)s_%(model_name)s"
         permissions = [  # noqa: RUF012
@@ -290,7 +382,7 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
     """
 
     TYPE = "maven"
-    CONTENT_TYPES = [MavenArtifact, MavenMetadata, MavenPackage]  # noqa: RUF012
+    CONTENT_TYPES = [MavenArtifact, MavenMetadata, MavenPackage, MavenIndexPage]  # noqa: RUF012
     REMOTE_TYPES = [MavenRemote]  # noqa: RUF012
     PULL_THROUGH_SUPPORTED = True
 
@@ -349,11 +441,12 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
         )
 
     def finalize_new_version(self, new_version):
-        """Remove duplicates, ensure packages, and generate metadata."""
+        """Remove duplicates, ensure packages, and generate metadata and index pages."""
         remove_duplicates(new_version)
         if not getattr(_pull_through_ctx, "active", False):
             self._ensure_packages(new_version)
             self._generate_metadata(new_version)
+            self._generate_index_pages(new_version)
 
     def _ensure_packages(self, new_version):
         """Manage MavenPackage version membership. Creates missing packages when a POM is available."""
@@ -611,6 +704,142 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
             if current_prefixes:
                 prefixes_pks = _save_prefixes_txt(current_prefixes, self.pulp_domain)
                 new_version.add_content(MavenMetadata.objects.filter(pk__in=prefixes_pks))
+
+    def _generate_index_pages(self, new_version, affected_paths=None):
+        """Generate HTML index pages for directory paths touched by this version.
+
+        Args:
+            new_version: The repository version being finalised.
+            affected_paths: Optional set of directory path strings (each ending in ``/``
+                or the empty string ``""`` for the root). When *None* (the default),
+                the set is computed from ``new_version.added()`` and
+                ``new_version.removed()`` — used during normal ``finalize_new_version``.
+                Pass an explicit set (e.g. from ``repair_index_pages``) to regenerate a
+                specific or complete collection of directories regardless of the diff.
+        """
+        import re as _re
+
+        from pulpcore.plugin.content import Handler
+        from pulpcore.plugin.models import ContentArtifact, RemoteArtifact
+
+        from pulp_maven.app.tasks import _save_artifact
+
+        if affected_paths is None:
+            # Compute all ancestor directory paths for added/removed non-index content.
+            added_pks = set(
+                MavenArtifact.objects.filter(pk__in=new_version.added()).values_list(
+                    "pk", flat=True
+                )
+            ) | set(
+                MavenMetadata.objects.filter(pk__in=new_version.added()).values_list(
+                    "pk", flat=True
+                )
+            )
+            removed_pks = set(
+                MavenArtifact.objects.filter(pk__in=new_version.removed()).values_list(
+                    "pk", flat=True
+                )
+            ) | set(
+                MavenMetadata.objects.filter(pk__in=new_version.removed()).values_list(
+                    "pk", flat=True
+                )
+            )
+
+            all_content_pks = added_pks | removed_pks
+            if not all_content_pks:
+                return
+
+            affected_paths = set()
+            for (relative_path,) in ContentArtifact.objects.filter(
+                content_id__in=all_content_pks
+            ).values_list("relative_path"):
+                parts = relative_path.split("/")
+                for i in range(len(parts)):
+                    affected_paths.add("" if i == 0 else "/".join(parts[:i]) + "/")
+
+        # Pre-fetch RepositoryContent dates once to avoid one DB query per directory
+        # (calling _content_relationships() inside the loop would be an N+1 pattern).
+        rc_dates = {
+            rc.content_id: rc.pulp_created
+            for rc in new_version._content_relationships().only("content_id", "pulp_created")
+        }
+
+        for dir_path in affected_paths:
+            # Remove the stale index page for this directory (inherited from previous version).
+            stale = MavenIndexPage.objects.filter(pk__in=new_version.content, path=dir_path)
+            if stale.exists():
+                new_version.remove_content(stale)
+
+            # Build the directory listing, excluding index.html entries.
+            cas = (
+                ContentArtifact.objects.select_related("artifact")
+                .filter(content__in=new_version.content, relative_path__startswith=dir_path)
+                .exclude(content__pulp_type="maven.index-page")
+            )
+
+            pattern = _re.compile(r"({})([^\/]*)(\/*)".format(_re.escape(dir_path)))
+            directory_list = set()
+            dates = {}
+            sizes = {}
+            artifacts_to_find = {}
+
+            for ca in cas:
+                m = pattern.match(ca.relative_path)
+                if not m:
+                    continue
+                name = "{}{}".format(m.group(2), m.group(3))
+                if not name:
+                    continue
+                directory_list.add(name)
+                # Use the RepositoryContent date (when content joined this repo) to match
+                # list_directory() behaviour; fall back to ContentArtifact creation time.
+                dates[name] = rc_dates.get(ca.content_id, ca.pulp_created)
+                if ca.artifact:
+                    sizes[name] = ca.artifact.size
+                else:
+                    artifacts_to_find[ca.pk] = name
+
+            if not directory_list:
+                continue
+
+            if artifacts_to_find:
+                r_artifacts = RemoteArtifact.objects.filter(
+                    content_artifact__in=artifacts_to_find.keys(), size__isnull=False
+                ).values_list("content_artifact_id", "size")
+                sizes.update({artifacts_to_find[ra_ca_id]: size for ra_ca_id, size in r_artifacts})
+
+            html_bytes = Handler.render_html(
+                directory_list, path=dir_path, dates=dates, sizes=sizes
+            ).encode("utf-8")
+
+            artifact = _save_artifact(html_bytes, self.pulp_domain)
+
+            page = MavenIndexPage(
+                path=dir_path,
+                sha256=artifact.sha256,
+                _pulp_domain=self.pulp_domain,
+            )
+            try:
+                with transaction.atomic():
+                    page.save()
+            except IntegrityError:
+                page = MavenIndexPage.objects.get(
+                    path=dir_path,
+                    sha256=artifact.sha256,
+                    _pulp_domain=self.pulp_domain,
+                )
+
+            try:
+                with transaction.atomic():
+                    ContentArtifact.objects.create(
+                        artifact=artifact,
+                        content=page,
+                        relative_path=f"{dir_path}index.html",
+                    )
+            except IntegrityError:
+                pass
+
+            new_version.add_content(MavenIndexPage.objects.filter(pk=page.pk))
 
     class Meta:
         default_related_name = "%(app_label)s_%(model_name)s"
