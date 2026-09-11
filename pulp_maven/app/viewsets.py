@@ -36,6 +36,7 @@ from pulp_maven.app.catalog import (
 from pulp_maven.app.models import (
     MavenArtifact,
     MavenDistribution,
+    MavenIndexPage,
     MavenMetadata,
     MavenPackage,
     MavenRemote,
@@ -45,6 +46,7 @@ from pulp_maven.app.serializers import (
     MavenArtifactSerializer,
     MavenArtifactUploadSerializer,
     MavenDistributionSerializer,
+    MavenIndexPageSerializer,
     MavenMetadataSerializer,
     MavenMetadataUploadSerializer,
     MavenPackageSerializer,
@@ -54,7 +56,11 @@ from pulp_maven.app.serializers import (
     MavenRepositorySerializer,
     RepositoryAddCachedContentSerializer,
 )
-from pulp_maven.app.tasks import add_cached_content_to_repository, repair_metadata
+from pulp_maven.app.tasks import (
+    add_cached_content_to_repository,
+    repair_index_pages,
+    repair_metadata,
+)
 from pulp_maven.app.versions import strip_build_suffix
 
 
@@ -274,7 +280,7 @@ class MavenPackageViewSet(ReadOnlyContentViewSet):
     filterset_class = MavenPackageFilter
 
     def filter_queryset(self, queryset):
-        """Apply ``collapse_builds`` after other backends so DISTINCT ON stays valid."""
+        """Apply `collapse_builds` after other backends so DISTINCT ON stays valid."""
         queryset = super().filter_queryset(queryset)
         if getattr(self, "action", "") != "list":
             return queryset
@@ -286,6 +292,27 @@ class MavenPackageViewSet(ReadOnlyContentViewSet):
         return queryset
 
     DEFAULT_ACCESS_POLICY = {  # noqa: RUF012
+        "statements": [
+            {
+                "action": ["list", "retrieve"],
+                "principal": "authenticated",
+                "effect": "allow",
+            },
+        ],
+        "queryset_scoping": {"function": "scope_queryset"},
+    }
+
+
+class MavenIndexPageViewSet(ReadOnlyContentViewSet):
+    """
+    A read-only ViewSet for MavenIndexPage.
+    """
+
+    endpoint_name = "maven/index-page"
+    queryset = MavenIndexPage.objects.all()
+    serializer_class = MavenIndexPageSerializer
+
+    DEFAULT_ACCESS_POLICY = {
         "statements": [
             {
                 "action": ["list", "retrieve"],
@@ -453,7 +480,7 @@ class MavenRepositoryViewSet(RepositoryViewSet, ModifyRepositoryActionMixin, Rol
                 ],
             },
             {
-                "action": ["repair_metadata"],
+                "action": ["repair_metadata", "repair_index_pages"],
                 "principal": "authenticated",
                 "effect": "allow",
                 "condition": [
@@ -507,7 +534,7 @@ class MavenRepositoryViewSet(RepositoryViewSet, ModifyRepositoryActionMixin, Rol
         return super().filter_queryset(queryset)
 
     def _requested_repository_version(self, repository):
-        """Resolve optional ``repository_version`` href/PRN, else latest complete version."""
+        """Resolve optional `repository_version` href/PRN, else latest complete version."""
         href = self.request.query_params.get("repository_version")
         if not href:
             return repository.latest_version()
@@ -638,7 +665,7 @@ class MavenRepositoryViewSet(RepositoryViewSet, ModifyRepositoryActionMixin, Rol
         Add to the repository any MavenArtifact and MavenMetadata that was cached using the
         remote since the last repository version was created.
 
-        The ``repository`` field has to be provided.
+        The `repository` field has to be provided.
         """
         serializer = RepositoryAddCachedContentSerializer(
             data=request.data, context={"request": request, "repository_pk": pk}
@@ -676,6 +703,32 @@ class MavenRepositoryViewSet(RepositoryViewSet, ModifyRepositoryActionMixin, Rol
         repository = self.get_object()
         result = dispatch(
             repair_metadata,
+            exclusive_resources=[repository],
+            kwargs={"repository_pk": str(repository.pk)},
+        )
+        return OperationPostponedResponse(result, request)
+
+    @extend_schema(
+        description=(
+            "Trigger an asynchronous task to generate (or regenerate) HTML directory "
+            "index pages for every directory in the latest repository version. "
+            "This is a one-time catch-up for repositories created before the "
+            "pre-generation feature was deployed. After the task completes every "
+            "directory URL will be served by a pre-generated page rather than the "
+            "on-demand fallback."
+        ),
+        summary="Repair index pages",
+        request=None,
+        responses={202: AsyncOperationResponseSerializer},
+    )
+    @action(detail=True, methods=["post"], url_path="repair_index_pages")
+    def repair_index_pages(self, request, pk, **kwargs):
+        """
+        Generate HTML directory index pages for all directories in the repository.
+        """
+        repository = self.get_object()
+        result = dispatch(
+            repair_index_pages,
             exclusive_resources=[repository],
             kwargs={"repository_pk": str(repository.pk)},
         )
