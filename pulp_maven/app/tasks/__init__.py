@@ -169,7 +169,17 @@ def _save_artifacts_batch(pages, pulp_domain):
     if new_items:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        from pulpcore.plugin.util import get_domain, set_domain
+
+        # ContextVar values (including the domain set by pulpcore's task runner) do
+        # NOT propagate to ThreadPoolExecutor worker threads.  Capture the domain in
+        # the calling thread and set it explicitly inside each worker.
+        # Context.run() cannot be used here because a single Context object cannot be
+        # entered concurrently by multiple threads.
+        current_domain = get_domain()
+
         def _upload(digest, html_bytes):
+            set_domain(current_domain)
             return digest, _save_artifact(html_bytes, pulp_domain)
 
         with ThreadPoolExecutor(max_workers=20) as pool:

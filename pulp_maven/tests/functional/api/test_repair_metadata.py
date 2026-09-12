@@ -9,6 +9,39 @@ import pytest
 
 from pulp_maven.tests.functional.utils import download_file
 
+# ---------------------------------------------------------------------------
+# Helper: check if the storage backend is S3-compatible (boto3 required)
+# ---------------------------------------------------------------------------
+
+
+def _s3_client(pulp_settings):
+    """Return a boto3 S3 client configured from pulp_settings, or None."""
+    try:
+        import boto3
+        from botocore.config import Config
+    except ImportError:
+        return None, None
+
+    backend = pulp_settings.STORAGES.get("default", {}).get("BACKEND", "")
+    if "s3" not in backend.lower():
+        return None, None
+
+    opts = pulp_settings.STORAGES["default"].get("OPTIONS", {})
+    endpoint = getattr(pulp_settings, "AWS_S3_ENDPOINT_URL", opts.get("endpoint_url"))
+    access = getattr(pulp_settings, "AWS_ACCESS_KEY_ID", opts.get("access_key"))
+    secret = getattr(pulp_settings, "AWS_SECRET_ACCESS_KEY", opts.get("secret_key"))
+    bucket = getattr(pulp_settings, "AWS_STORAGE_BUCKET_NAME", opts.get("bucket_name"))
+    style = getattr(pulp_settings, "AWS_S3_ADDRESSING_STYLE", opts.get("addressing_style", "auto"))
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access,
+        aws_secret_access_key=secret,
+        config=Config(signature_version="s3v4", s3={"addressing_style": style}),
+    )
+    return client, bucket
+
 
 def _uid():
     return uuid.uuid4().hex[:8]
@@ -755,3 +788,184 @@ def test_repair_index_pages_idempotent(
             f"{path} HTML changed between first and second repair — "
             "batch existence-check may be returning wrong artifacts"
         )
+
+
+@pytest.mark.parallel
+def test_repair_index_pages_after_stripping(
+    pulpcore_bindings,
+    maven_repo_factory,
+    maven_distribution_factory,
+    maven_artifact_api_client,
+    maven_repo_api_client,
+    random_artifact_factory,
+    monitor_task,
+    distribution_base_url,
+):
+    """repair_index_pages re-creates pages that were removed from the version.
+
+    Simulates a repository whose pre-generated index pages were stripped (e.g. by
+    the operator, or because they were created with a buggy code path).  After
+    stripping, repair must re-attach or regenerate the pages so they are served
+    correctly from the distribution.
+
+    This test guards against the ContextVar domain context bug (issue #465): when
+    repair uploads artifacts in parallel via ThreadPoolExecutor, worker threads must
+    use the correct domain so files land in the right S3 bucket.  A broken
+    implementation stores files in the default domain's bucket, causing
+    FileNotFoundError when the content app tries to serve them from the
+    repository's domain bucket.
+    """
+    repo = maven_repo_factory()
+    distro = maven_distribution_factory(repository=repo.pulp_href)
+    base_url = distribution_base_url(distro.base_url)
+    uid = uuid.uuid4().hex[:8]
+
+    content_hrefs = []
+    for version in ["1.0.0", "2.0.0"]:
+        for ext in ["jar", "pom"]:
+            a = random_artifact_factory(size=64)
+            c = maven_artifact_api_client.upload(
+                artifact=a.pulp_href,
+                relative_path=f"com/{uid}/strip-lib/{version}/strip-lib-{version}.{ext}",
+            )
+            content_hrefs.append(c.pulp_href)
+
+    monitor_task(
+        maven_repo_api_client.modify(repo.pulp_href, {"add_content_units": content_hrefs}).task
+    )
+    repo = maven_repo_api_client.read(repo.pulp_href)
+
+    # Strip all pre-generated index pages from the version, simulating a repo
+    # that predates the pre-generation feature or had its pages deleted.
+    index_pages = pulpcore_bindings.ContentApi.list(
+        repository_version=repo.latest_version_href,
+        pulp_type__in=["maven.index-page"],
+        limit=100,
+    )
+    if index_pages.count > 0:
+        index_hrefs = [p.pulp_href for p in index_pages.results]
+        monitor_task(
+            maven_repo_api_client.modify(repo.pulp_href, {"remove_content_units": index_hrefs}).task
+        )
+        repo = maven_repo_api_client.read(repo.pulp_href)
+
+    # Confirm pages are gone from the version.
+    pages_after_strip = pulpcore_bindings.ContentApi.list(
+        repository_version=repo.latest_version_href,
+        pulp_type__in=["maven.index-page"],
+    )
+    assert pages_after_strip.count == 0, "Index pages still present after stripping"
+
+    # Run repair — must regenerate pages and attach them to a new version.
+    monitor_task(maven_repo_api_client.repair_index_pages(repo.pulp_href).task)
+    repo = maven_repo_api_client.read(repo.pulp_href)
+
+    pages_after_repair = pulpcore_bindings.ContentApi.list(
+        repository_version=repo.latest_version_href,
+        pulp_type__in=["maven.index-page"],
+        limit=100,
+    )
+    assert pages_after_repair.count > 0, "No index pages after repair"
+
+    # Pages must be downloadable and contain the expected entries.
+    # If artifacts were stored in the wrong domain (issue #465), this would
+    # raise FileNotFoundError and the test would fail with a 500 or exception.
+    parent_html = download_file(urljoin(base_url, f"com/{uid}/strip-lib/")).body.decode()
+    assert "1.0.0/" in parent_html, "1.0.0/ missing from strip-lib/ page after repair"
+    assert "2.0.0/" in parent_html, "2.0.0/ missing from strip-lib/ page after repair"
+
+    v1_html = download_file(urljoin(base_url, f"com/{uid}/strip-lib/1.0.0/")).body.decode()
+    assert "strip-lib-1.0.0.jar" in v1_html, "jar missing from 1.0.0/ page after repair"
+    assert "strip-lib-1.0.0.pom" in v1_html, "pom missing from 1.0.0/ page after repair"
+
+
+@pytest.mark.parallel
+def test_repair_index_pages_domain_context(
+    pulpcore_bindings,
+    pulp_settings,
+    domain_factory,
+    maven_repo_factory,
+    maven_distribution_factory,
+    maven_artifact_api_client,
+    maven_repo_api_client,
+    random_artifact_factory,
+    monitor_task,
+    distribution_base_url,
+):
+    """repair_index_pages stores artifacts in the correct domain's S3 bucket.
+
+    When repair uploads artifacts in parallel via ThreadPoolExecutor, each worker
+    thread must have the correct domain context so get_artifact_path() generates
+    a path that includes the domain UUID (e.g. artifact/<uuid>/ab/cd...) rather
+    than the default-domain path (artifact/ab/cd...).
+
+    This test is only meaningful with DOMAIN_ENABLED=True and S3 storage.
+    domain_factory auto-skips if domains are disabled; _s3_client skips if S3
+    is not configured.
+
+    Failure mode of the bug (issue #465):
+        Artifacts are stored at artifact/<sha256[:2]>/<sha256[2:]> (default
+        domain path, no UUID) instead of artifact/<domain-uuid>/...  The content
+        app then looks for the file in the correct domain's bucket and raises
+        FileNotFoundError.
+    """
+    s3, bucket = _s3_client(pulp_settings)
+    if s3 is None:
+        pytest.skip("S3 storage not configured — cannot verify S3 object path")
+
+    # Create a non-default domain.  domain_factory auto-skips if DOMAIN_ENABLED=False.
+    domain = domain_factory()
+    domain_uuid = domain.pulp_href.rstrip("/").split("/")[-1]
+
+    uid = uuid.uuid4().hex[:8]
+    repo = maven_repo_factory(pulp_domain=domain.name)
+    distro = maven_distribution_factory(repository=repo.pulp_href, pulp_domain=domain.name)
+    base_url = distribution_base_url(distro.base_url)
+
+    content_hrefs = []
+    for version in ["1.0.0", "2.0.0"]:
+        for ext in ["jar", "pom"]:
+            a = random_artifact_factory(size=64)
+            c = maven_artifact_api_client.upload(
+                artifact=a.pulp_href,
+                relative_path=f"com/{uid}/ctx-lib/{version}/ctx-lib-{version}.{ext}",
+                pulp_domain=domain.name,
+            )
+            content_hrefs.append(c.pulp_href)
+
+    monitor_task(
+        maven_repo_api_client.modify(repo.pulp_href, {"add_content_units": content_hrefs}).task
+    )
+
+    # Run repair — this is where the ContextVar domain context propagation matters.
+    monitor_task(maven_repo_api_client.repair_index_pages(repo.pulp_href).task)
+
+    # Download a directory listing — if the artifact was stored in the wrong domain
+    # this would raise FileNotFoundError (500 error).
+    parent_html = download_file(urljoin(base_url, f"com/{uid}/ctx-lib/")).body
+    assert b"1.0.0/" in parent_html and b"2.0.0/" in parent_html
+
+    # Compute the sha256 of the generated HTML to derive the expected S3 key.
+    sha256 = hashlib.sha256(parent_html).hexdigest()
+    correct_key = f"artifact/{domain_uuid}/{sha256[:2]}/{sha256[2:]}"
+    wrong_key = f"artifact/{sha256[:2]}/{sha256[2:]}"
+
+    # The artifact MUST be at the domain-specific path (contains the UUID).
+    try:
+        s3.head_object(Bucket=bucket, Key=correct_key)
+    except Exception:
+        pytest.fail(
+            f"Artifact not found at domain-specific S3 key '{correct_key}'. "
+            f"Domain context was not propagated to ThreadPoolExecutor workers (issue #465)."
+        )
+
+    # The artifact must NOT be at the default-domain path (no UUID prefix).
+    # If the bug were present the file would be here instead of the domain path.
+    try:
+        s3.head_object(Bucket=bucket, Key=wrong_key)
+        pytest.fail(
+            f"Artifact found at default-domain path '{wrong_key}' — "
+            f"it should be at the domain-specific path '{correct_key}'."
+        )
+    except Exception:
+        pass  # Expected: file should not be in the default-domain location.
